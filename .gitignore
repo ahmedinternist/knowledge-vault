@@ -1,0 +1,27 @@
+# JavaScript dependencies
+node_modules/
+
+# Electron build output and release artifacts
+dist/
+dist-*/
+*.blockmap
+
+# Generated self-contained .NET PDF engine
+backend/pdf-indexer/
+pdf-indexer/bin/
+pdf-indexer/obj/
+# A prior publish may leave runtime DLLs next to the source; keep only C# source/project files.
+pdf-indexer/*
+!pdf-indexer/*.cs
+!pdf-indexer/*.csproj
+
+# Local SDK, package, and preview caches
+.dotnet/
+.dotnet-home/
+.nuget/
+.kv-preview-profile/
+
+# Local tooling and operating-system files
+.env
+.DS_Store
+Thumbs.db

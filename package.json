@@ -1,0 +1,35 @@
+{
+  "name": "knowledge-vault",
+  "version": "0.1.0",
+  "description": "Local-first medical document library for Windows",
+  "author": {
+    "name": "Dr. Ahmed Hakim",
+    "email": "ahmedhakim1978@gmail.com"
+  },
+  "main": "electron-main.cjs",
+  "scripts": {
+    "prestart": "npm run build:indexer",
+    "start": "electron .",
+    "build:indexer": "dotnet publish pdf-indexer/PdfIndexer.csproj -c Release -r win-x64 --self-contained true -o backend/pdf-indexer",
+    "build:win": "npm run build:indexer && electron-builder --win portable",
+    "build:installer": "npm run build:indexer && electron-builder --win nsis"
+  },
+  "build": {
+    "appId": "com.knowledgevault.desktop",
+    "productName": "Knowledge Vault",
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Knowledge Vault"
+    },
+    "icon": "assets/knowledge-vault-vault-icon.ico",
+    "files": ["index.html", "styles.css", "glass-theme.css", "app.js", "electron-main.cjs", "electron-preload.cjs", "assets/**/*"],
+    "extraResources": [{ "from": "backend/pdf-indexer", "to": "pdf-indexer" }]
+  },
+  "devDependencies": {
+    "electron": "^37.2.6",
+    "electron-builder": "^26.0.12"
+  }
+}
