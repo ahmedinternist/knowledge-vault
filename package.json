@@ -22,7 +22,8 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Knowledge Vault"
+      "shortcutName": "Knowledge Vault",
+      "include": "installer.nsh"
     },
     "icon": "assets/knowledge-vault-vault-icon.ico",
     "files": ["index.html", "styles.css", "glass-theme.css", "app.js", "electron-main.cjs", "electron-preload.cjs", "assets/**/*"],

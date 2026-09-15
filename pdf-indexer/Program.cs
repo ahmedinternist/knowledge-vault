@@ -21,11 +21,11 @@ switch (command)
 {
     case "add-file" when !string.IsNullOrWhiteSpace(argument):
         AddSource(database, argument, "file");
-        Console.WriteLine(JsonSerializer.Serialize(await Rescan(database)));
+        Console.WriteLine(JsonSerializer.Serialize(new { indexed = await Rescan(database) }));
         break;
     case "add-folder" when !string.IsNullOrWhiteSpace(argument):
         AddSource(database, argument, "folder");
-        Console.WriteLine(JsonSerializer.Serialize(await Rescan(database)));
+        Console.WriteLine(JsonSerializer.Serialize(new { indexed = await Rescan(database) }));
         break;
     case "exclude" when !string.IsNullOrWhiteSpace(argument):
         AddExclusion(database, argument);
@@ -39,11 +39,11 @@ switch (command)
         Console.WriteLine("true");
         break;
     case "rescan":
-        Console.WriteLine(JsonSerializer.Serialize(await Rescan(database)));
+        Console.WriteLine(JsonSerializer.Serialize(new { indexed = await Rescan(database) }));
         break;
     case "rescan-progress":
         var scanned = await Rescan(database, progress => Console.WriteLine(JsonSerializer.Serialize(progress)));
-        Console.WriteLine(JsonSerializer.Serialize(new ScanProgress("complete", "", "", scanned.Count)));
+        Console.WriteLine(JsonSerializer.Serialize(new ScanProgress("complete", "", "", scanned)));
         break;
     case "remove-missing":
         Console.WriteLine(RemoveMissingSources(database));
@@ -66,6 +66,9 @@ switch (command)
     case "trash":
         Console.WriteLine(JsonSerializer.Serialize(ListDocuments(database, true)));
         break;
+    case "list-page":
+        Console.WriteLine(JsonSerializer.Serialize(ListDocumentPage(database, JsonSerializer.Deserialize<PageRequest>(argument ?? "{}") ?? new PageRequest())));
+        break;
     case "trash-file" when !string.IsNullOrWhiteSpace(argument):
         SetTrashState(database, argument, true);
         Console.WriteLine("true");
@@ -79,6 +82,15 @@ switch (command)
         break;
     case "search" when !string.IsNullOrWhiteSpace(argument):
         Console.WriteLine(JsonSerializer.Serialize(SearchDocuments(database, argument)));
+        break;
+    case "search-page":
+        Console.WriteLine(JsonSerializer.Serialize(SearchDocumentPage(database, JsonSerializer.Deserialize<PageRequest>(argument ?? "{}") ?? new PageRequest())));
+        break;
+    case "titles":
+        Console.WriteLine(JsonSerializer.Serialize(GetTitleSuggestions(database)));
+        break;
+    case "thumbnail" when !string.IsNullOrWhiteSpace(argument):
+        Console.WriteLine(await EnsureThumbnail(database, argument));
         break;
     case "update-meta" when !string.IsNullOrWhiteSpace(argument):
         UpdateMetadata(database, JsonSerializer.Deserialize<MetadataUpdate>(argument) ?? throw new ArgumentException("Invalid metadata update."));
@@ -129,6 +141,9 @@ switch (command)
         break;
     case "collection-documents" when !string.IsNullOrWhiteSpace(argument):
         Console.WriteLine(JsonSerializer.Serialize(GetCollectionDocuments(database, argument)));
+        break;
+    case "collection-page" when !string.IsNullOrWhiteSpace(argument):
+        Console.WriteLine(JsonSerializer.Serialize(GetCollectionDocumentPage(database, JsonSerializer.Deserialize<NamedPageRequest>(argument) ?? throw new ArgumentException("Invalid collection page request."))));
         break;
     case "update-collection" when !string.IsNullOrWhiteSpace(argument):
         UpdateCollectionAppearance(database, JsonSerializer.Deserialize<CollectionAppearance>(argument) ?? throw new ArgumentException("Invalid collection appearance."));
@@ -260,11 +275,16 @@ static void SetSourceScanMode(SqliteConnection db, SourceScanUpdate update)
 }
 static void RemoveFolderSource(SqliteConnection db, string path)
 {
-    path = Path.GetFullPath(path);
+    path = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    if (path.Length == 2 && path[1] == Path.VolumeSeparatorChar) path += Path.DirectorySeparatorChar;
     var kind = ScalarString(db, "SELECT kind FROM sources WHERE path=$path", ("$path", path));
     if (!string.Equals(kind, "folder", StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("Only folder scan sources can be removed here.");
-    // Keep indexed records: this action only stops future scanning of the folder.
-    Execute(db, "DELETE FROM sources WHERE path=$path AND kind='folder'", ("$path", path));
+    var prefix = path.EndsWith(Path.DirectorySeparatorChar) ? path : path + Path.DirectorySeparatorChar;
+    // Remove the scan source and every catalog record below it, including collection and tag links.
+    Execute(db, "DELETE FROM collection_documents WHERE document_path=$path OR substr(document_path,1,length($prefix))=$prefix", ("$path", path), ("$prefix", prefix));
+    Execute(db, "DELETE FROM document_tags WHERE document_path=$path OR substr(document_path,1,length($prefix))=$prefix", ("$path", path), ("$prefix", prefix));
+    Execute(db, "DELETE FROM documents WHERE path=$path OR substr(path,1,length($prefix))=$prefix", ("$path", path), ("$prefix", prefix));
+    Execute(db, "DELETE FROM sources WHERE path=$path OR substr(path,1,length($prefix))=$prefix", ("$path", path), ("$prefix", prefix));
 }
 static void RemoveLibraryRecord(SqliteConnection db, string path)
 {
@@ -277,19 +297,45 @@ static void RemoveLibraryRecord(SqliteConnection db, string path)
     Execute(db, "DELETE FROM sources WHERE path=$path AND kind='file'", ("$path", path));
     tx.Commit();
 }
-static async Task<List<DocumentInfo>> Rescan(SqliteConnection db, Action<ScanProgress>? progress = null)
+static async Task<int> Rescan(SqliteConnection db, Action<ScanProgress>? progress = null)
 {
     var exclusions = QueryStrings(db, "SELECT path FROM exclusions");
     var processed = 0;
     foreach (var source in GetSources(db))
     {
-        progress?.Invoke(new ScanProgress("source", source.Path, source.Path, processed));
-        if (source.Kind == "file") { progress?.Invoke(new ScanProgress("file", source.Path, source.Path, processed)); await IndexFile(db, source.Path, exclusions); processed++; }
-        else foreach (var file in EnumeratePdfFiles(source.Path, exclusions, source.ScanSubfolders)) { progress?.Invoke(new ScanProgress("file", source.Path, file, processed)); await IndexFile(db, file, exclusions); processed++; }
+        progress?.Invoke(CreateScanProgress("source", source.Path, source.Path, processed));
+        if (source.Kind == "file")
+        {
+            progress?.Invoke(CreateScanProgress("file", source.Path, source.Path, processed));
+            try { await IndexFile(db, source.Path, exclusions); }
+            catch (Exception ex) { Log(db, source.Path, "warning", $"Scan continued after this PDF failed: {ex.Message}"); }
+            processed++;
+            await YieldScanMemory(processed);
+        }
+        else foreach (var file in EnumeratePdfFiles(source.Path, exclusions, source.ScanSubfolders))
+        {
+            progress?.Invoke(CreateScanProgress("file", source.Path, file, processed));
+            try { await IndexFile(db, file, exclusions); }
+            catch (Exception ex) { Log(db, file, "warning", $"Scan continued after this PDF failed: {ex.Message}"); }
+            processed++;
+            await YieldScanMemory(processed);
+        }
         Execute(db, "UPDATE sources SET last_scanned_at = $now WHERE path = $path", ("$now", DateTimeOffset.UtcNow.ToString("O")), ("$path", source.Path));
     }
-    return ListDocuments(db);
+    TrimThumbnailCache(350L * 1024 * 1024);
+    return processed;
 }
+
+static async Task YieldScanMemory(int processed)
+{
+    // Indexing is deliberately single-file-at-a-time. Periodically release
+    // disposed PDF/image buffers before continuing a long scan.
+    if (processed == 0 || processed % 12 != 0) return;
+    GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+    await Task.Delay(12);
+}
+
+static ScanProgress CreateScanProgress(string type, string source, string path, int processed) => new(type, source, path, processed, Environment.WorkingSet, GC.GetTotalMemory(false));
 
 static IEnumerable<string> EnumeratePdfFiles(string folder, HashSet<string> exclusions, bool scanSubfolders)
 {
@@ -310,33 +356,85 @@ static async Task IndexFile(SqliteConnection db, string path, HashSet<string> ex
         var file = new FileInfo(path);
         var hash = Sha256(path);
         using var pdf = PdfDocument.Open(path);
-        var info = pdf.Information;
-        var title = CleanTitle(string.IsNullOrWhiteSpace(info.Title) ? Path.GetFileNameWithoutExtension(path) : info.Title);
-        var content = string.Join('\n', pdf.GetPages().Select(page => page.Text));
-        if (content.Length > 300000) content = content[..300000];
+        var title = CleanTitle(Path.GetFileNameWithoutExtension(path));
+        string? author = null, subject = null, keywords = null;
+        try
+        {
+            var info = pdf.Information;
+            var metadataTitle = info.Title;
+            if (!string.IsNullOrWhiteSpace(metadataTitle)) title = CleanTitle(metadataTitle);
+            author = info.Author;
+            subject = info.Subject;
+            keywords = info.Keywords;
+        }
+        catch (Exception ex)
+        {
+            Log(db, path, "warning", $"Malformed PDF metadata was ignored: {ex.Message}");
+        }
+        // Full PDF text is expensive to keep in memory and is used only by the
+        // legacy keyword smart-collection rule. It is opt-in for large libraries.
+        var content = "";
+        if (Environment.GetEnvironmentVariable("PDF_LIBRARY_MANAGER_FULL_TEXT") == "1")
+        {
+            var text = new StringBuilder(300000);
+            foreach (var page in pdf.GetPages())
+            {
+                if (text.Length >= 300000) break;
+                text.AppendLine(page.Text);
+            }
+            content = text.Length > 300000 ? text.ToString(0, 300000) : text.ToString();
+        }
         var duplicate = ScalarString(db, "SELECT path FROM documents WHERE hash = $hash AND path <> $path LIMIT 1", ("$hash", hash), ("$path", path));
         string? thumbnail = null;
         try { thumbnail = await GetOrCreateThumbnail(path, hash); }
         catch (Exception ex) { Log(db, path, "warning", $"Metadata was indexed, but thumbnail creation failed: {ex.Message}"); }
-        UpsertDocument(db, new DocumentInfo(path, hash, file.Length, file.CreationTimeUtc, file.LastWriteTimeUtc, title, info.Author, info.Subject, info.Keywords, pdf.NumberOfPages, thumbnail, null, duplicate, content));
+        UpsertDocument(db, new DocumentInfo(path, hash, file.Length, file.CreationTimeUtc, file.LastWriteTimeUtc, title, author, subject, keywords, pdf.NumberOfPages, thumbnail, null, duplicate, content));
     }
-    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException)
+    catch (Exception ex) when (ex is not IOException && ex is not UnauthorizedAccessException)
     {
-        Log(db, path, "warning", $"Skipped unreadable PDF: {ex.Message}");
+        // Some real-world PDFs have broken metadata or page-tree entries but still open in Windows readers.
+        // Keep the file in the catalog with filename metadata instead of losing it during a folder scan.
+        try
+        {
+            var file = new FileInfo(path);
+            if (!file.Exists || file.Length == 0)
+            {
+                Log(db, path, "warning", $"Skipped unreadable PDF: {ex.Message}");
+                return;
+            }
+            var hash = Sha256(path);
+            var duplicate = ScalarString(db, "SELECT path FROM documents WHERE hash = $hash AND path <> $path LIMIT 1", ("$hash", hash), ("$path", path));
+            string? thumbnail = null;
+            try { thumbnail = await GetOrCreateThumbnail(path, hash); }
+            catch (Exception thumbnailError) { Log(db, path, "warning", $"Indexed with limited metadata; thumbnail was unavailable: {thumbnailError.Message}"); }
+            UpsertDocument(db, new DocumentInfo(path, hash, file.Length, file.CreationTimeUtc, file.LastWriteTimeUtc, CleanTitle(Path.GetFileNameWithoutExtension(path)), null, null, null, 0, thumbnail, null, duplicate, ""));
+            Log(db, path, "warning", $"Indexed with limited metadata because the PDF structure could not be fully read: {ex.Message}");
+        }
+        catch (Exception fallbackError)
+        {
+            Log(db, path, "warning", $"Skipped unreadable PDF after metadata recovery failed: {fallbackError.Message}");
+        }
     }
     catch (Exception ex)
     {
-        Log(db, path, "error", $"Skipped corrupt PDF: {ex.Message}");
+        Log(db, path, "warning", $"Skipped unreadable PDF: {ex.Message}");
     }
 }
 
 static Task<string> GetOrCreateThumbnail(string pdfPath, string hash)
 {
-    var thumbnailPath = Path.Combine(GetDataDirectory(), "thumbnails", $"{hash}.png");
+    var thumbnailDirectory = Path.Combine(GetDataDirectory(), "thumbnails");
+    Directory.CreateDirectory(thumbnailDirectory);
+    var thumbnailPath = Path.Combine(thumbnailDirectory, $"{hash}.webp");
     if (File.Exists(thumbnailPath)) return Task.FromResult(thumbnailPath);
 
+    // Replace legacy, oversized PNG thumbnails the next time a document is
+    // indexed.  Thumbnails are disposable and will be recreated if needed.
+    var legacyThumbnailPath = Path.Combine(thumbnailDirectory, $"{hash}.png");
+    if (File.Exists(legacyThumbnailPath)) File.Delete(legacyThumbnailPath);
+
     using var pdf = File.OpenRead(pdfPath);
-    Conversion.SavePng(imageFilename: thumbnailPath, pdfStream: pdf, page: 0, leaveOpen: true, password: null, options: new RenderOptions(Width: 360, Height: null, WithAspectRatio: true));
+    Conversion.SaveWebp(imageFilename: thumbnailPath, pdfStream: pdf, page: 0, leaveOpen: true, password: null, options: new RenderOptions(Width: 240, Height: null, WithAspectRatio: true));
     return Task.FromResult(thumbnailPath);
 }
 
@@ -359,9 +457,9 @@ static void UpsertDocument(SqliteConnection db, DocumentInfo item)
     cmd.Parameters.AddWithValue("$path", item.Path); cmd.Parameters.AddWithValue("$hash", item.Hash); cmd.Parameters.AddWithValue("$size", item.Size); cmd.Parameters.AddWithValue("$created", item.CreatedAt.ToString("O")); cmd.Parameters.AddWithValue("$modified", item.ModifiedAt.ToString("O")); cmd.Parameters.AddWithValue("$title", item.Title); cmd.Parameters.AddWithValue("$author", item.Author ?? ""); cmd.Parameters.AddWithValue("$subject", item.Subject ?? ""); cmd.Parameters.AddWithValue("$keywords", item.Keywords ?? ""); cmd.Parameters.AddWithValue("$pages", item.Pages); cmd.Parameters.AddWithValue("$thumbnail", item.ThumbnailPath ?? ""); cmd.Parameters.AddWithValue("$cover", item.CoverImagePath ?? ""); cmd.Parameters.AddWithValue("$duplicate", item.DuplicateOf ?? ""); cmd.Parameters.AddWithValue("$indexed", DateTimeOffset.UtcNow.ToString("O")); cmd.Parameters.AddWithValue("$content", item.ContentText ?? ""); cmd.ExecuteNonQuery();
 }
 
-static List<DocumentInfo> ListDocuments(SqliteConnection db, bool deletedOnly = false)
+static List<DocumentInfo> ListDocuments(SqliteConnection db, bool deletedOnly = false, bool includeContent = false)
 {
-    using var cmd = db.CreateCommand(); cmd.CommandText = $"SELECT path,hash,size,created_at,modified_at,title,author,subject,keywords,pages,thumbnail_path,cover_image_path,duplicate_of,content_text FROM documents WHERE path IS NOT NULL AND is_deleted = {(deletedOnly ? 1 : 0)} ORDER BY modified_at DESC";
+    using var cmd = db.CreateCommand(); cmd.CommandText = $"SELECT path,hash,size,created_at,modified_at,title,author,subject,keywords,pages,thumbnail_path,cover_image_path,duplicate_of,{(includeContent ? "content_text" : "NULL")} FROM documents WHERE path IS NOT NULL AND is_deleted = {(deletedOnly ? 1 : 0)} ORDER BY modified_at DESC";
     using var reader = cmd.ExecuteReader(); var items = new List<DocumentInfo>();
     while (reader.Read()) items.Add(new DocumentInfo(reader.GetString(0), reader.GetString(1), reader.GetInt64(2), DateTimeOffset.Parse(reader.GetString(3)), DateTimeOffset.Parse(reader.GetString(4)), reader.GetString(5), reader.GetString(6), reader.GetString(7), reader.GetString(8), reader.GetInt32(9), NullIfEmpty(reader.GetString(10)), reader.IsDBNull(11) ? null : NullIfEmpty(reader.GetString(11)), NullIfEmpty(reader.GetString(12)), reader.IsDBNull(13) ? null : NullIfEmpty(reader.GetString(13))));
     return items;
@@ -370,12 +468,79 @@ static List<DocumentInfo> ListDocuments(SqliteConnection db, bool deletedOnly = 
 static List<DocumentInfo> SearchDocuments(SqliteConnection db, string query)
 {
     using var cmd = db.CreateCommand();
-    cmd.CommandText = "SELECT path,hash,size,created_at,modified_at,title,author,subject,keywords,pages,thumbnail_path,cover_image_path,duplicate_of,content_text FROM documents WHERE is_deleted = 0 AND title LIKE $query ORDER BY modified_at DESC";
+    cmd.CommandText = "SELECT path,hash,size,created_at,modified_at,title,author,subject,keywords,pages,thumbnail_path,cover_image_path,duplicate_of,NULL FROM documents WHERE is_deleted = 0 AND title LIKE $query ORDER BY modified_at DESC";
     cmd.Parameters.AddWithValue("$query", $"%{query.Replace("%", "[%]").Replace("_", "[_]")}%");
     using var reader = cmd.ExecuteReader(); var items = new List<DocumentInfo>();
     while (reader.Read()) items.Add(new DocumentInfo(reader.GetString(0), reader.GetString(1), reader.GetInt64(2), DateTimeOffset.Parse(reader.GetString(3)), DateTimeOffset.Parse(reader.GetString(4)), reader.GetString(5), reader.GetString(6), reader.GetString(7), reader.GetString(8), reader.GetInt32(9), NullIfEmpty(reader.GetString(10)), reader.IsDBNull(11) ? null : NullIfEmpty(reader.GetString(11)), NullIfEmpty(reader.GetString(12)), reader.IsDBNull(13) ? null : NullIfEmpty(reader.GetString(13))));
     return items;
 }
+
+static DocumentPage ListDocumentPage(SqliteConnection db, PageRequest request)
+{
+    var offset = Math.Max(0, request.Offset);
+    var limit = Math.Clamp(request.Limit, 1, 120);
+    using var count = db.CreateCommand();
+    count.CommandText = "SELECT COUNT(*) FROM documents WHERE path IS NOT NULL AND is_deleted=0";
+    var total = Convert.ToInt32(count.ExecuteScalar());
+    using var cmd = db.CreateCommand();
+    cmd.CommandText = "SELECT path,hash,size,created_at,modified_at,title,author,subject,keywords,pages,thumbnail_path,cover_image_path,duplicate_of,NULL FROM documents WHERE path IS NOT NULL AND is_deleted=0 ORDER BY modified_at DESC LIMIT $limit OFFSET $offset";
+    cmd.Parameters.AddWithValue("$limit", limit); cmd.Parameters.AddWithValue("$offset", offset);
+    using var reader = cmd.ExecuteReader(); var items = new List<DocumentInfo>();
+    while (reader.Read()) items.Add(ReadDocument(reader));
+    return new DocumentPage(items, total);
+}
+
+static DocumentPage SearchDocumentPage(SqliteConnection db, PageRequest request)
+{
+    var offset = Math.Max(0, request.Offset);
+    var limit = Math.Clamp(request.Limit, 1, 120);
+    var terms = System.Text.RegularExpressions.Regex.Split(request.Query?.Trim() ?? "", @"\s+").Where(term => term.Length > 0).Take(8).ToList();
+    var where = new StringBuilder("path IS NOT NULL AND is_deleted=0");
+    for (var index = 0; index < terms.Count; index++) where.Append($" AND LOWER(title) LIKE LOWER($term{index}) ESCAPE '\\'");
+    void AddTerms(SqliteCommand command)
+    {
+        for (var index = 0; index < terms.Count; index++) command.Parameters.AddWithValue($"$term{index}", $"%{terms[index].Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_")}%");
+    }
+    using var count = db.CreateCommand(); count.CommandText = $"SELECT COUNT(*) FROM documents WHERE {where}"; AddTerms(count);
+    var total = Convert.ToInt32(count.ExecuteScalar());
+    using var cmd = db.CreateCommand(); cmd.CommandText = $"SELECT path,hash,size,created_at,modified_at,title,author,subject,keywords,pages,thumbnail_path,cover_image_path,duplicate_of,NULL FROM documents WHERE {where} ORDER BY modified_at DESC LIMIT $limit OFFSET $offset"; AddTerms(cmd); cmd.Parameters.AddWithValue("$limit", limit); cmd.Parameters.AddWithValue("$offset", offset);
+    using var reader = cmd.ExecuteReader(); var items = new List<DocumentInfo>(); while (reader.Read()) items.Add(ReadDocument(reader));
+    return new DocumentPage(items, total);
+}
+
+static List<string> GetTitleSuggestions(SqliteConnection db)
+{
+    using var cmd = db.CreateCommand(); cmd.CommandText = "SELECT DISTINCT title FROM documents WHERE is_deleted=0 AND TRIM(title)<>'' ORDER BY title COLLATE NOCASE LIMIT 500";
+    using var reader = cmd.ExecuteReader(); var titles = new List<string>(); while (reader.Read()) titles.Add(reader.GetString(0)); return titles;
+}
+
+static async Task<string> EnsureThumbnail(SqliteConnection db, string pdfPath)
+{
+    var path = Path.GetFullPath(pdfPath);
+    using var cmd = db.CreateCommand(); cmd.CommandText = "SELECT hash FROM documents WHERE path=$path AND is_deleted=0"; cmd.Parameters.AddWithValue("$path", path);
+    var hash = cmd.ExecuteScalar() as string ?? throw new ArgumentException("PDF is not in the library.");
+    var thumbnail = await GetOrCreateThumbnail(path, hash);
+    Execute(db, "UPDATE documents SET thumbnail_path=$thumbnail WHERE path=$path", ("$thumbnail", thumbnail), ("$path", path));
+    return thumbnail;
+}
+
+static void TrimThumbnailCache(long maxBytes)
+{
+    var directory = Path.Combine(GetDataDirectory(), "thumbnails");
+    if (!Directory.Exists(directory)) return;
+    var files = new DirectoryInfo(directory).EnumerateFiles("*.*", SearchOption.TopDirectoryOnly)
+        .Where(file => file.Extension.Equals(".webp", StringComparison.OrdinalIgnoreCase) || file.Extension.Equals(".png", StringComparison.OrdinalIgnoreCase) || file.Extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase) || file.Extension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase))
+        .OrderByDescending(file => file.LastAccessTimeUtc == DateTime.MinValue ? file.LastWriteTimeUtc : file.LastAccessTimeUtc).ToList();
+    long retained = 0;
+    foreach (var file in files)
+    {
+        retained += file.Length;
+        if (retained <= maxBytes) continue;
+        try { file.Delete(); } catch { /* A visible cover can be recreated later. */ }
+    }
+}
+
+static DocumentInfo ReadDocument(SqliteDataReader reader) => new(reader.GetString(0), reader.GetString(1), reader.GetInt64(2), DateTimeOffset.Parse(reader.GetString(3)), DateTimeOffset.Parse(reader.GetString(4)), reader.GetString(5), reader.GetString(6), reader.GetString(7), reader.GetString(8), reader.GetInt32(9), NullIfEmpty(reader.GetString(10)), reader.IsDBNull(11) ? null : NullIfEmpty(reader.GetString(11)), NullIfEmpty(reader.GetString(12)), reader.IsDBNull(13) ? null : NullIfEmpty(reader.GetString(13)));
 
 static void UpdateMetadata(SqliteConnection db, MetadataUpdate update)
 {
@@ -481,7 +646,34 @@ static void UpdateCollectionAppearance(SqliteConnection db, CollectionAppearance
 
 static List<DocumentInfo> GetCollectionDocuments(SqliteConnection db, string name)
 {
-    using var cmd = db.CreateCommand(); cmd.CommandText = "SELECT d.path,d.hash,d.size,d.created_at,d.modified_at,d.title,d.author,d.subject,d.keywords,d.pages,d.thumbnail_path,d.cover_image_path,d.duplicate_of,d.content_text FROM documents d INNER JOIN collection_documents cd ON cd.document_path=d.path WHERE cd.collection_name=$name AND d.is_deleted=0 ORDER BY d.modified_at DESC"; cmd.Parameters.AddWithValue("$name", name); using var reader = cmd.ExecuteReader(); var items = new List<DocumentInfo>(); while (reader.Read()) items.Add(new DocumentInfo(reader.GetString(0), reader.GetString(1), reader.GetInt64(2), DateTimeOffset.Parse(reader.GetString(3)), DateTimeOffset.Parse(reader.GetString(4)), reader.GetString(5), reader.GetString(6), reader.GetString(7), reader.GetString(8), reader.GetInt32(9), NullIfEmpty(reader.GetString(10)), reader.IsDBNull(11) ? null : NullIfEmpty(reader.GetString(11)), NullIfEmpty(reader.GetString(12)), reader.IsDBNull(13) ? null : NullIfEmpty(reader.GetString(13)))); return items;
+    using var cmd = db.CreateCommand(); cmd.CommandText = "SELECT d.path,d.hash,d.size,d.created_at,d.modified_at,d.title,d.author,d.subject,d.keywords,d.pages,d.thumbnail_path,d.cover_image_path,d.duplicate_of,NULL FROM documents d INNER JOIN collection_documents cd ON cd.document_path=d.path WHERE cd.collection_name=$name AND d.is_deleted=0 ORDER BY d.modified_at DESC"; cmd.Parameters.AddWithValue("$name", name); using var reader = cmd.ExecuteReader(); var items = new List<DocumentInfo>(); while (reader.Read()) items.Add(new DocumentInfo(reader.GetString(0), reader.GetString(1), reader.GetInt64(2), DateTimeOffset.Parse(reader.GetString(3)), DateTimeOffset.Parse(reader.GetString(4)), reader.GetString(5), reader.GetString(6), reader.GetString(7), reader.GetString(8), reader.GetInt32(9), NullIfEmpty(reader.GetString(10)), reader.IsDBNull(11) ? null : NullIfEmpty(reader.GetString(11)), NullIfEmpty(reader.GetString(12)), reader.IsDBNull(13) ? null : NullIfEmpty(reader.GetString(13)))); return items;
+}
+
+static DocumentPage GetCollectionDocumentPage(SqliteConnection db, NamedPageRequest request)
+{
+    var offset = Math.Max(0, request.Offset);
+    var limit = Math.Clamp(request.Limit, 1, 120);
+    var terms = System.Text.RegularExpressions.Regex.Split(request.Query?.Trim() ?? "", @"\s+").Where(term => term.Length > 0).Take(8).ToList();
+    var where = new StringBuilder("cd.collection_name=$name AND d.is_deleted=0");
+    for (var index = 0; index < terms.Count; index++) where.Append($" AND LOWER(d.title) LIKE LOWER($term{index}) ESCAPE '\\'");
+    void AddParameters(SqliteCommand command)
+    {
+        command.Parameters.AddWithValue("$name", request.Name);
+        for (var index = 0; index < terms.Count; index++) command.Parameters.AddWithValue($"$term{index}", $"%{terms[index].Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_")}%");
+    }
+    using var count = db.CreateCommand();
+    count.CommandText = $"SELECT COUNT(*) FROM collection_documents cd INNER JOIN documents d ON d.path=cd.document_path WHERE {where}";
+    AddParameters(count);
+    var total = Convert.ToInt32(count.ExecuteScalar());
+    using var cmd = db.CreateCommand();
+    cmd.CommandText = $"SELECT d.path,d.hash,d.size,d.created_at,d.modified_at,d.title,d.author,d.subject,d.keywords,d.pages,d.thumbnail_path,d.cover_image_path,d.duplicate_of,NULL FROM documents d INNER JOIN collection_documents cd ON cd.document_path=d.path WHERE {where} ORDER BY d.modified_at DESC LIMIT $limit OFFSET $offset";
+    AddParameters(cmd);
+    cmd.Parameters.AddWithValue("$limit", limit);
+    cmd.Parameters.AddWithValue("$offset", offset);
+    using var reader = cmd.ExecuteReader();
+    var items = new List<DocumentInfo>();
+    while (reader.Read()) items.Add(ReadDocument(reader));
+    return new DocumentPage(items, total);
 }
 
 static List<string> GetDocumentTags(SqliteConnection db, string path)
@@ -515,15 +707,16 @@ static void DeleteSmartCollection(SqliteConnection db, string name) => Execute(d
 static List<DocumentInfo> GetSmartCollectionDocuments(SqliteConnection db, string name)
 {
     var shelf = GetSmartCollections(db).FirstOrDefault(item => item.Name.Equals(name, StringComparison.Ordinal)) ?? throw new ArgumentException("Smart collection not found.");
-    var documents = ListDocuments(db);
+    var documents = ListDocuments(db, includeContent: true);
     var ruleValue = shelf.RuleValue ?? "";
-    return shelf.RuleType switch
+    var matches = shelf.RuleType switch
     {
         "author" => documents.Where(doc => (doc.Author ?? "").Contains(ruleValue, StringComparison.OrdinalIgnoreCase)).ToList(),
         "keyword" => documents.Where(doc => (doc.Keywords ?? "").Contains(ruleValue, StringComparison.OrdinalIgnoreCase) || (doc.Subject ?? "").Contains(ruleValue, StringComparison.OrdinalIgnoreCase) || (doc.ContentText ?? "").Contains(ruleValue, StringComparison.OrdinalIgnoreCase)).ToList(),
         "folder" => documents.Where(doc => doc.Path.StartsWith(Path.GetFullPath(ruleValue), StringComparison.OrdinalIgnoreCase)).ToList(),
         _ => documents
     };
+    return matches.Select(doc => doc with { ContentText = null }).ToList();
 }
 
 static void SetTrashState(SqliteConnection db, string path, bool deleted)
@@ -567,13 +760,16 @@ static string? ScalarString(SqliteConnection db, string sql, params (string Name
 static void Execute(SqliteConnection db, string sql, params (string Name, string Value)[] parameters) { using var cmd = db.CreateCommand(); cmd.CommandText = sql; foreach (var (name, value) in parameters) cmd.Parameters.AddWithValue(name, value); cmd.ExecuteNonQuery(); }
 static string? NullIfEmpty(string value) => string.IsNullOrWhiteSpace(value) ? null : value;
 record DocumentInfo(string Path, string Hash, long Size, DateTimeOffset CreatedAt, DateTimeOffset ModifiedAt, string Title, string? Author, string? Subject, string? Keywords, int Pages, string? ThumbnailPath, string? CoverImagePath, string? DuplicateOf, string? ContentText = null);
+record PageRequest(int Offset = 0, int Limit = 60, string? Query = null);
+record NamedPageRequest(string Name, int Offset = 0, int Limit = 60, string? Query = null);
+record DocumentPage(List<DocumentInfo> Items, int Total);
 record MetadataUpdate(string Path, string Title, string? Author, string? Subject, string? Keywords, int Pages, string CreatedAt, string ModifiedAt);
 record AuthorUpdate(string CurrentAuthor, string NewAuthor);
 record DocumentCoverUpdate(string Path, string? CoverImagePath);
 record SourceScanUpdate(string Path, bool ScanSubfolders);
 record SourceInfo(string Path, string Kind, bool ScanSubfolders);
 record SourceStat(string Path, string Kind, int DocumentCount, string? LastScannedAt);
-record ScanProgress(string Type, string Source, string Path, int Processed);
+record ScanProgress(string Type, string Source, string Path, int Processed, long WorkingSetBytes = 0, long ManagedBytes = 0);
 record ScanLogInfo(string Path, string Level, string Message, string CreatedAt);
 record CollectionInfo(string Name, int DocumentCount, string? Icon, string? ImagePath);
 record CollectionAppearance(string Name, string? Icon, string? ImagePath);
